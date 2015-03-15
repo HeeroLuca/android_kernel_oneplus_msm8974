@@ -173,6 +173,7 @@ static int msm_compr_set_volume(struct snd_compr_stream *cstream,
 {
 	struct msm_compr_audio *prtd;
 	int rc = 0;
+	uint32_t avg_vol;
 
 	pr_debug("%s: volume_l %d volume_r %d\n",
 		__func__, volume_l, volume_r);
@@ -181,43 +182,35 @@ static int msm_compr_set_volume(struct snd_compr_stream *cstream,
 		return -EPERM;
 	}
 	prtd = cstream->runtime->private_data;
-	if (prtd && prtd->audio_client) {
-		if (volume_l != volume_r) {
-			pr_debug("%s: call q6asm_set_lrgain\n", __func__);
-			rc = q6asm_set_lrgain(prtd->audio_client,
-						volume_l, volume_r);
-			if (rc < 0) {
-				pr_err("%s: set lrgain command failed rc=%d\n",
-				__func__, rc);
-				return rc;
-			}
-			/*
-			 * set master gain to unity so that only lr gain
-			 * is effective
-			 */
-			rc = q6asm_set_volume(prtd->audio_client,
-						COMPRESSED_LR_VOL_MAX_STEPS);
-		} else {
-			pr_debug("%s: call q6asm_set_volume\n", __func__);
-			/*
-			 * set left and right channel gain to unity so that
-			 * only master gain is effective
-			 */
-			rc = q6asm_set_lrgain(prtd->audio_client,
-						COMPRESSED_LR_VOL_MAX_STEPS,
-						COMPRESSED_LR_VOL_MAX_STEPS);
-			if (rc < 0) {
-				pr_err("%s: set lrgain command failed rc=%d\n",
-				__func__, rc);
-				return rc;
-			}
-			rc = q6asm_set_volume(prtd->audio_client, volume_l);
-		}
-		if (rc < 0) {
-			pr_err("%s: Send Volume command failed rc=%d\n",
-				__func__, rc);
-		}
+
+	if (!prtd || !prtd->audio_client) {
+		pr_err("%s: invalid session prtd or no audio client", __func__);
+		return rc;
 	}
+
+	if (prtd->num_channels > 2) {
+		/*
+		 * Currently the left and right gains are averaged an applied
+		 * to all channels. This might not be desirable. But currently,
+		 * there exists no API in userspace to send a list of gains for
+		 * each channel either. If such an API does become available,
+		 * the mixer control must be updated to accept more than 2
+		 * channel gains.
+		 *
+		 */
+		pr_debug("%s: call q6asm_set_volume for multichannel\n",
+			 __func__);
+		avg_vol = (volume_l + volume_r) / 2;
+		rc = q6asm_set_volume(prtd->audio_client, avg_vol);
+	} else {
+		pr_debug("%s: call q6asm_set_lrgain\n", __func__);
+		rc = q6asm_set_lrgain(prtd->audio_client, volume_l,
+				      volume_r);
+	}
+
+	if (rc < 0)
+		pr_err("%s: Send vol gain command failed rc=%d\n",
+		       __func__, rc);
 
 	return rc;
 }
@@ -517,6 +510,11 @@ static void compr_event_handler(uint32_t opcode,
 		snd_compr_fragment_elapsed(cstream);
 		prtd->copied_total = prtd->bytes_received;
 		atomic_set(&prtd->error, 1);
+		wake_up(&prtd->drain_wait);
+		if (atomic_cmpxchg(&prtd->eos, 1, 0)) {
+			pr_debug("%s:unblock eos wait queues", __func__);
+			wake_up(&prtd->eos_wait);
+		}
 		spin_unlock_irqrestore(&prtd->lock, flags);
 		break;
 	default:
@@ -705,14 +703,15 @@ static int msm_compr_configure_dsp(struct snd_compr_stream *cstream)
 	};
 	if (prtd->codec_param.codec.format == SNDRV_PCM_FORMAT_S24_LE)
 		bits_per_sample = 24;
-	if (prtd->codec_param.codec.format == SNDRV_PCM_FORMAT_S32_LE)
+	else if (prtd->codec_param.codec.format == SNDRV_PCM_FORMAT_S32_LE)
 		bits_per_sample = 32;
 
-	pr_debug("%s: stream_id %d\n", __func__, ac->stream_id);
+	pr_debug("%s: stream_id %d bits_per_sample %d\n",
+			__func__, ac->stream_id, bits_per_sample);
 	ret = q6asm_stream_open_write_v2(ac,
-				prtd->codec, bits_per_sample,
-				ac->stream_id,
-				prtd->gapless_state.use_dsp_gapless_mode);
+			prtd->codec, bits_per_sample,
+			ac->stream_id,
+			prtd->gapless_state.use_dsp_gapless_mode);
 	if (ret < 0) {
 		pr_err("%s: Session out open failed\n", __func__);
 		 return -ENOMEM;
@@ -1130,13 +1129,19 @@ static int msm_compr_drain_buffer(struct msm_compr_audio *prtd,
 	rc = wait_event_interruptible(prtd->drain_wait,
 					prtd->drain_ready ||
 					prtd->cmd_interrupt ||
-					atomic_read(&prtd->xrun));
+					atomic_read(&prtd->xrun) ||
+					atomic_read(&prtd->error));
 	pr_debug("%s: out of buffer drain wait with ret %d\n", __func__, rc);
 	spin_lock_irqsave(&prtd->lock, *flags);
 	if (prtd->cmd_interrupt) {
 		pr_debug("%s: buffer drain interrupted by flush)\n", __func__);
 		rc = -EINTR;
 		prtd->cmd_interrupt = 0;
+	}
+	if (atomic_read(&prtd->error)) {
+		pr_err("%s: Got RESET EVENTS notification, return\n",
+			__func__);
+		rc = -ENETRESET;
 	}
 	return rc;
 }
@@ -1194,6 +1199,7 @@ static int msm_compr_trigger(struct snd_compr_stream *cstream, int cmd)
 	unsigned long flags;
 	int stream_id;
 	uint32_t stream_index;
+	uint16_t bits_per_sample = 16;
 
 	if (cstream->direction != SND_COMPRESS_PLAYBACK) {
 		pr_err("%s: Unsupported stream type\n", __func__);
@@ -1212,17 +1218,15 @@ static int msm_compr_trigger(struct snd_compr_stream *cstream, int cmd)
 	case SNDRV_PCM_TRIGGER_START:
 		pr_debug("%s: SNDRV_PCM_TRIGGER_START\n", __func__);
 		atomic_set(&prtd->start, 1);
-		q6asm_run_nowait(prtd->audio_client, 0, 0, 0);
 
-		msm_compr_set_volume(cstream, 0, 0);
-		if (rc)
-			pr_err("%s : Set Volume (0,0) failed : %d\n",
-				__func__, rc);
-
-		msm_compr_set_volume(cstream, volume[0], volume[1]);
+		/* set volume for the stream before RUN */
+		rc = msm_compr_set_volume(cstream, volume[0], volume[1]);
 		if (rc)
 			pr_err("%s : Set Volume failed : %d\n",
 				__func__, rc);
+
+		/* issue RUN command for the stream */
+		q6asm_run_nowait(prtd->audio_client, 0, 0, 0);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 		spin_lock_irqsave(&prtd->lock, flags);
@@ -1436,7 +1440,9 @@ static int msm_compr_trigger(struct snd_compr_stream *cstream, int cmd)
 
 		/* Wait indefinitely for  DRAIN. Flush can also signal this*/
 		rc = wait_event_interruptible(prtd->eos_wait,
-				      (prtd->eos_ack || prtd->cmd_interrupt));
+						(prtd->eos_ack ||
+						prtd->cmd_interrupt ||
+						atomic_read(&prtd->error)));
 
 		if (rc < 0)
 			pr_err("%s: EOS wait failed\n", __func__);
@@ -1446,6 +1452,12 @@ static int msm_compr_trigger(struct snd_compr_stream *cstream, int cmd)
 
 		if (prtd->cmd_interrupt)
 			rc = -EINTR;
+
+		if (atomic_read(&prtd->error)) {
+			pr_err("%s: Got RESET EVENTS notification, return\n",
+				__func__);
+			rc = -ENETRESET;
+		}
 
 		/*FIXME : what if a flush comes while PC is here */
 		if (rc == 0) {
@@ -1553,9 +1565,17 @@ static int msm_compr_trigger(struct snd_compr_stream *cstream, int cmd)
 			}
 			break;
 		}
-		pr_debug("%s: open_write stream_id %d", __func__, stream_id);
+
+		if (prtd->codec_param.codec.format == SNDRV_PCM_FORMAT_S24_LE)
+			bits_per_sample = 24;
+		else if (prtd->codec_param.codec.format ==
+			 SNDRV_PCM_FORMAT_S32_LE)
+			bits_per_sample = 32;
+
+		pr_debug("%s: open_write stream_id %d bits_per_sample %d",
+				__func__, stream_id, bits_per_sample);
 		rc = q6asm_stream_open_write_v2(prtd->audio_client,
-				prtd->codec, 16,
+				prtd->codec, bits_per_sample,
 				stream_id,
 				prtd->gapless_state.use_dsp_gapless_mode);
 		if (rc < 0) {

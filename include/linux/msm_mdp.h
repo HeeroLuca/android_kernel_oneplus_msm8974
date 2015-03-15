@@ -222,6 +222,7 @@ enum {
 #define MDP_MEMORY_ID_TYPE_FB		0x00001000
 #define MDP_BWC_EN			0x00000400
 #define MDP_DECIMATION_EN		0x00000800
+#define MDP_SMP_FORCE_ALLOC            0x00200000
 #define MDP_TRANSP_NOP 0xffffffff
 #define MDP_ALPHA_NOP 0xff
 
@@ -529,6 +530,7 @@ enum mdss_mdp_blend_op {
 	BLEND_OP_MAX,
 };
 
+#define DECIMATED_DIMENSION(dim, deci) (((dim) + ((1 << (deci)) - 1)) >> (deci))
 #define MAX_PLANES	4
 struct mdp_scale_data {
 	uint8_t enable_pxl_ext;
